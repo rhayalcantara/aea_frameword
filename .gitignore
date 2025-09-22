@@ -1,0 +1,12 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Archivos de entorno
+.env
+
+# Archivos de sistema
+.DS_Store
+
+# Colas de mensajes (si decidimos mantenerlas fuera del repo)
+/queues/

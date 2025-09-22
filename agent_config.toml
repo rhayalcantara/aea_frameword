@@ -1,0 +1,21 @@
+
+# agent_config.toml para el agente de prueba 'file-lister'
+
+[identity]
+name = "file-lister"
+role = "Listar los archivos en el directorio de trabajo."
+
+[environment]
+# El agente operará sobre su propio directorio de framework
+working_dir = "/Users/rhayalcantara/proyectos/aea_framework"
+
+[communication]
+# Rutas absolutas a las colas que acabamos de crear
+orchestrator_queue = "/Users/rhayalcantara/proyectos/queues/lister_in.json"
+agent_queue = "/Users/rhayalcantara/proyectos/queues/lister_out.json"
+
+[plan]
+objective = "Listar todos los archivos y subdirectorios y notificar."
+tasks = [
+    "Ejecutar el listado de archivos con 'ls -la'."
+]
