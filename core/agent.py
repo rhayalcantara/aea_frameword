@@ -3,12 +3,13 @@ import asyncio
 import toml
 import time
 import json
+import os
 from typing import Dict, Any, List
 
 from core.state import AgentState
 from mcp.queue_manager import read_from_queue, write_to_queue
 from tools.shell import run_command
-# Importaremos más herramientas a medida que las necesitemos
+from tools.filesystem import create_report
 
 class Agent:
     def __init__(self, config_path: str):
@@ -19,6 +20,7 @@ class Agent:
         )
         self.comm_config = self.config['communication']
         self.plan = self.config['plan']
+        self.working_dir = self.config['environment']['working_dir']
 
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         """Carga la configuración desde un archivo TOML."""
@@ -38,38 +40,54 @@ class Agent:
 
     async def _process_task(self, task: str):
         """Procesa una única tarea del plan."""
-        await self._send_message("STATUS_UPDATE", {"message": f"Iniciando tarea: {task}"})
+        await self._send_message("STATUS_UPDATE", {"message": f"Iniciando tarea: {task[:80]}..."})
         
-        # Lógica simple para mapear tarea a comando
-        # Esto se puede hacer mucho más sofisticado
         try:
-            if task.startswith("Ejecutar"): # Ej: "Ejecutar el build... con 'npm run build'."
+            if task.startswith("Ejecutar"):
                 command = task.split("'")[1]
-                result = await run_command(command, self.config['environment']['working_dir'])
-                
+                result = await run_command(command, self.working_dir)
                 if result["exit_code"] != 0:
                     raise Exception(f"Error al ejecutar comando: {result['stderr']}")
-                
-                await self._send_message("STATUS_UPDATE", {"message": f"Tarea completada: {task}", "details": result["stdout"]})
-                self.state.add_history({"task": task, "result": result})
-            else:
-                # Aquí iría la lógica para otras tareas (git, filesystem, etc.)
-                await self._send_message("STATUS_UPDATE", {"message": f"Simulando tarea: {task}"})
-                await asyncio.sleep(1) # Simula trabajo
+                details = result["stdout"]
 
+            elif task.startswith("Crear el archivo"):
+                parts = task.split("'''")
+                content = parts[1].strip()
+                filename = task.split("'")[1]
+                filepath = os.path.join(self.working_dir, filename)
+                # Usaremos create_report que funciona como un generic write_file
+                result = await create_report(filepath, content)
+                if result["status"] != "SUCCESS":
+                    raise Exception(f"Error al escribir archivo: {result['message']}")
+                details = f"Archivo {filename} creado exitosamente."
+            
+            else:
+                # Tarea no reconocida, la simulamos
+                details = f"Simulando tarea no reconocida: {task[:80]}..."
+                await asyncio.sleep(1)
+
+            await self._send_message("STATUS_UPDATE", {"message": f"Tarea completada: {task[:80]}...", "details": details})
+            self.state.add_history({"task": task, "result": details})
             self.state.next_task()
 
         except Exception as e:
             self.state.set_status("ERROR")
-            await self._send_message("ERROR", {"message": f"Fallo en la tarea: {task}", "error": str(e)})
+            await self._send_message("ERROR", {"message": f"Fallo en la tarea: {task[:80]}...", "error": str(e)})
 
 
     async def run(self):
         """El bucle de vida principal del agente."""
-        await self._send_message("STATUS_UPDATE", {"message": "Agente iniciado. Esperando comando START."}) 
+        # Asegurarse que el directorio de trabajo exista
+        if not os.path.isdir(self.working_dir):
+            await self._send_message("ERROR", {"message": f"El directorio de trabajo no existe: {self.working_dir}"})
+            self.state.set_status("ERROR")
+            print(f"Agente {self.state.name} ha finalizado con error.")
+            return
+
+        await self._send_message("STATUS_UPDATE", {"message": "Agente iniciado. Esperando comando START."})
         self.state.set_status("IDLE")
 
-        while self.state.status != "FINISHED" and self.state.status != "ERROR":
+        while self.state.status not in ["FINISHED", "ERROR"]:
             # 1. Escuchar por comandos del orquestador
             messages = read_from_queue(self.comm_config['orchestrator_queue'])
             for msg in messages:
