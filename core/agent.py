@@ -1,4 +1,3 @@
-
 import asyncio
 import toml
 import time
@@ -38,63 +37,88 @@ class Agent:
         }
         write_to_queue(self.comm_config['agent_queue'], message)
 
-    async def _process_task(self, task: str):
-        """Procesa una única tarea del plan."""
-        await self._send_message("STATUS_UPDATE", {"message": f"Iniciando tarea: {task[:80]}..."})
+    async def _process_task(self, task: Dict[str, Any]):
+        """Procesa una única tarea estructurada del plan."""
+        action = task.get('action')
+        task_description = f"{action}: {task.get('filename', task.get('command', ''))}"
+        await self._send_message("STATUS_UPDATE", {"message": f"Iniciando tarea: {task_description}"})
         
         try:
-            if task.startswith("Ejecutar"):
-                command = task.split("'")[1]
+            details = ""
+            if action == "run_command":
+                command = task.get('command', '')
                 result = await run_command(command, self.working_dir)
                 if result["exit_code"] != 0:
                     raise Exception(f"Error al ejecutar comando: {result['stderr']}")
                 details = result["stdout"]
 
-            elif task.startswith("Crear el archivo"):
-                parts = task.split("'''")
-                content = parts[1].strip()
-                filename = task.split("'")[1]
+            elif action == "write_file":
+                content = task.get('content', '')
+                filename = task.get('filename', '')
                 filepath = os.path.join(self.working_dir, filename)
-                # Usaremos create_report que funciona como un generic write_file
-                result = await create_report(filepath, content)
+                result = await create_report(filepath, content) # create_report es nuestro write_file
                 if result["status"] != "SUCCESS":
                     raise Exception(f"Error al escribir archivo: {result['message']}")
                 details = f"Archivo {filename} creado exitosamente."
             
-            else:
-                # Tarea no reconocida, la simulamos
-                details = f"Simulando tarea no reconocida: {task[:80]}..."
-                await asyncio.sleep(1)
+            elif action == "generate_and_write_code":
+                server_url = task.get('server_url')
+                output_file = os.path.join(self.working_dir, task.get('output_file'))
+                
+                await self._send_message("QUESTION", {
+                    "message": f"Necesito que generes código para conectar a {server_url} y listar modelos.",
+                    "request_type": "generate_code",
+                    "server_url": server_url,
+                    "output_file": output_file
+                })
+                self.state.set_status("AWAITING_RESPONSE")
+                details = "Esperando código generado del orquestador."
 
-            await self._send_message("STATUS_UPDATE", {"message": f"Tarea completada: {task[:80]}...", "details": details})
-            self.state.add_history({"task": task, "result": details})
-            self.state.next_task()
+            else:
+                raise Exception(f"Acción de tarea no reconocida: {action}")
+
+            if self.state.status != "AWAITING_RESPONSE": # No avanzar si estamos esperando respuesta
+                await self._send_message("STATUS_UPDATE", {"message": f"Tarea completada: {task_description}", "details": details})
+                self.state.add_history({"task": task_description, "result": details})
+                self.state.next_task()
 
         except Exception as e:
             self.state.set_status("ERROR")
-            await self._send_message("ERROR", {"message": f"Fallo en la tarea: {task[:80]}...", "error": str(e)})
+            await self._send_message("ERROR", {"message": f"Fallo en la tarea: {task_description}", "error": str(e)})
 
 
     async def run(self):
         """El bucle de vida principal del agente."""
-        # Asegurarse que el directorio de trabajo exista
         if not os.path.isdir(self.working_dir):
-            await self._send_message("ERROR", {"message": f"El directorio de trabajo no existe: {self.working_dir}"})
-            self.state.set_status("ERROR")
-            print(f"Agente {self.state.name} ha finalizado con error.")
-            return
+            os.makedirs(self.working_dir, exist_ok=True)
+            await self._send_message("STATUS_UPDATE", {"message": f"Directorio de trabajo no existía. Creado: {self.working_dir}"})
 
         await self._send_message("STATUS_UPDATE", {"message": "Agente iniciado. Esperando comando START."})
         self.state.set_status("IDLE")
 
         while self.state.status not in ["FINISHED", "ERROR"]:
-            # 1. Escuchar por comandos del orquestador
             messages = read_from_queue(self.comm_config['orchestrator_queue'])
             for msg in messages:
                 if msg.get('type') == 'COMMAND' and msg['payload'].get('action') == 'START':
                     if self.state.status == 'IDLE':
                         self.state.set_status("RUNNING")
                         await self._send_message("STATUS_UPDATE", {"message": "Comando START recibido. Iniciando plan."})
+                elif msg.get('type') == 'COMMAND' and msg['payload'].get('action') == 'CODE_GENERATED':
+                    if self.state.status == 'AWAITING_RESPONSE':
+                        generated_code = msg['payload']['code']
+                        output_file = msg['payload']['output_file']
+                        
+                        # Escribir el código generado en el archivo
+                        result = await create_report(output_file, generated_code)
+                        if result["status"] != "SUCCESS":
+                            await self._send_message("ERROR", {"message": f"Fallo al escribir el código generado en {output_file}", "error": result['message']})
+                            self.state.set_status("ERROR")
+                            break
+                        
+                        await self._send_message("STATUS_UPDATE", {"message": f"Código generado y escrito en {output_file}"})
+                        self.state.add_history({"task": "generate_and_write_code", "result": f"Código escrito en {output_file}"})
+                        self.state.next_task()
+                        self.state.set_status("RUNNING") # Volver a RUNNING para continuar el plan
 
             # 2. Ejecutar el plan si el estado es RUNNING
             if self.state.status == "RUNNING":
@@ -102,7 +126,6 @@ class Agent:
                     current_task = self.plan['tasks'][self.state.current_task_index]
                     await self._process_task(current_task)
                 else:
-                    # Todas las tareas completadas
                     self.state.set_status("FINISHED")
                     await self._send_message("STATUS_UPDATE", {"message": "Plan completado exitosamente."})
 
@@ -112,4 +135,3 @@ class Agent:
         final_status = self.state.status
         await self._send_message("STATUS_UPDATE", {"message": f"Agente finalizado con estado: {final_status}"})
         print(f"Agente {self.state.name} ha finalizado.")
-
